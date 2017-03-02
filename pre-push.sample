@@ -1,0 +1,220 @@
+#! /usr/bin/env python
+# -*- encoding: utf-8 -*-
+#
+# An example of hook script to verify if the code follow the standars rules of the project
+#
+# O seguinte hook realiza os seguintes passos:
+# 1. Verifica se os requisitos mínimos foram atendidos
+# 2. Verifica se a branch é do tipo imediata {IME}
+# 3. Verifica por violações realizadas na branch
+# 4. Compara violações da branch com a master
+# 5. Exibe os resultados
+# 6. Aprova ou Reprova o PUSH.
+#
+# AUTHOR: matheus.uehara
+
+import os
+import stat
+import errno
+import re
+import subprocess
+import sys
+import fileinput
+
+root_dir = os.getenv("PWD")
+checkstyle_jar = os.getenv('CHECKSTYLE_JAR', "%s/../../Programs/checkstyle/checkstyle-6.1.1-all.jar"%(root_dir))
+checkstyle_cfg = os.getenv('CHECKSTYLE_CFG', "%s/config/checkstyle/checkstyle.xml" %(root_dir))
+
+java_cmd = "java"
+git_cmd = "git"
+
+violacoesLocais = {}
+violacoesMaster = {}
+
+#Colors
+HEADER = '\033[95m'
+OKBLUE = '\033[94m'
+OKGREEN = '\033[92m'
+WARNING = '\033[93m'
+FAIL = '\033[91m'
+ENDC = '\033[0m'
+BOLD = '\033[1m'
+UNDERLINE = '\033[4m'
+
+# Verificando requisitos minimos para execução do script
+def verificaRequisitos():
+    if not os.path.isfile(checkstyle_jar):
+        sys.stderr.write("checkstyle JAR not found (%s)\n" % checkstyle_jar)
+        sys.exit(1)
+
+    if not os.path.isfile(checkstyle_cfg):
+        sys.stderr.write("checkstyle config not found (%s)\n" % checkstyle_cfg)
+        sys.exit(1)
+
+    if "check_output" not in dir( subprocess ):
+        sys.stderr.write("python >= 2.7 is required\n")
+        sys.exit(1)
+
+# Se o chamado for imediato a verificação do checkstyle é pulada
+def verificaPrioridade():
+    prioridade = subprocess.check_output([git_cmd,"rev-parse", "--abbrev-ref","HEAD" ])
+    if (("{ime}" in prioridade) or ("{IME}" in prioridade)):
+        sys.stderr.write("%sA verificação de CHECKSTYLE para seu chamado só será realizada pelo servidor remoto. Caso possua alguma violação, a equipe será notificada\n%s" %(WARNING, ENDC))
+        sys.exit(0)
+
+# Pegando os arquivos .JAVA que foram modificados
+def capturaAlteracoes():
+
+    CURRENT_BRANCH = subprocess.check_output([git_cmd, "rev-parse" ,"--abbrev-ref","HEAD"])
+
+    #Aqui retiramos o \n
+    CURRENT_BRANCH = CURRENT_BRANCH.rstrip()
+
+    branchesInterval = "origin/master.."+CURRENT_BRANCH
+
+    commits = subprocess.check_output(["git", "rev-list", branchesInterval ,"--count"])
+
+    git_head = "HEAD"
+
+    for i in range(int(commits)):
+        git_head += "^"
+
+    file_list = subprocess.check_output([git_cmd , "diff", "--diff-filter=ACMRTUXB*" ,"--name-only", git_head , "..HEAD"])
+
+    file_list = [f for f in file_list.splitlines() if f.endswith('.java')]
+
+    #print file_list
+    modificacoes = len(file_list)
+    
+    if ( modificacoes > 0):
+        return file_list
+    else: 
+        sys.stderr.write("%sCommit aprovado%s \n" %(OKGREEN , ENDC))
+        sys.exit(0)
+
+# Exibindo a lista de arquivos modificados
+def exibeModificacoes(file_list):
+    print "Arquivos Modificados:"
+    for i in file_list:
+        print OKBLUE + i + ENDC
+    print ""
+
+#Substitui o valor da variável do arquivo checkstyle.xml
+def replaceFile(atual,futuro):
+    f = open(checkstyle_cfg,'r')
+    filedata = f.read()
+    f.close()
+
+    newdata = filedata.replace(atual,futuro)
+
+    f = open(checkstyle_cfg,'w')
+    f.write(newdata)
+    f.close()
+
+# Rodando verificação de checkstyle
+def verificaViolacoes(listaDeArquivos):
+    replaceFile("${basedir}",root_dir)
+    violacoes = {}
+    for source_file in listaDeArquivos:
+        try:
+            with open(os.devnull, 'w') as devnull:
+                subprocess.check_output([java_cmd, "-jar", checkstyle_jar, "-c", checkstyle_cfg," -f xml -o checkstyle_errors.xml ", source_file], stderr=devnull) 
+                violacoes[source_file] = 0           
+        except subprocess.CalledProcessError as err:
+            checkRegexp = re.compile(r'\.java:')
+            messages = [checkRegexp.split(m)[-1] for m in err.output.splitlines() if checkRegexp.search(m) is not None]
+            #Loop de debug nas violações encontradas 
+            if (len(messages) > 0):
+                for m in messages:
+                    # na verificação o nullpointer só será recebido caso o arquivo seja Novo (A)
+                    if ("java.lang.NullPointerException" in m ):
+                        violacoes[source_file] = 0
+                        #usar em caso de debug
+                        #print ' => ' + m 
+                    else:
+                        violacoes[source_file] = len(messages)
+    #print violacoes
+    replaceFile(root_dir,"${basedir}")
+    return violacoes
+       
+# Criando diretório para armazenar os arquivos que serão baixados da master
+def criaDiretorioTemp(directory):
+    os.system ("mkdir -p %s " %(directory))
+
+#Apaga diretório temporário e os arquivos baixados
+def apagaDiretorioTemp(directory):
+    os.system("rm -rf %s" %(directory))
+
+# Pegando versão da master dos arquivos que foram modificados localmente
+def getArquivosMaster(violacoesLocais):
+    arquivosMaster = []
+    for j in violacoesLocais:
+        if ( violacoesLocais[j] > 0):
+            caminhoArquivo = j
+            temp = caminhoArquivo.split('/')
+            nomeArquivoTemp = "%s/masterTempCheckstyle/%s" %(root_dir[:-9],temp[-1])
+            arquivosMaster.append(nomeArquivoTemp)
+            try:
+                comando = "git show master:%s >> %s 2> /dev/null" %(caminhoArquivo , nomeArquivoTemp)
+                os.system(comando)
+            #Não vai entrar no except por conta do /dev/null adicionado
+            except OSError:
+                print "ARQUIVO %s FOI ADICIONADO" %(temp[-1])
+        else:
+            print "Arquivo : %s %s = OK %s" %(OKGREEN , j , ENDC)
+    return arquivosMaster
+
+def comparaViolacoes(violacoesLocais , violacoesMaster):
+    contador = 0
+    print
+    for i in violacoesLocais:
+        for j in violacoesMaster:
+            arquivo1 = i
+            arquivo2 = j
+            split1 = arquivo1.split('/')
+            split2 = arquivo2.split('/')
+            nomeArquivo1 = split1[-1]
+            nomeArquivo2 = split2[-1]
+            if ((nomeArquivo1 == nomeArquivo2) and (violacoesLocais[i] > violacoesMaster[j])):
+                checkstyle = violacoesLocais[i] - violacoesMaster[j]
+                sys.stderr.write("%s %s  (+%i) violações adicionadas %s " %(FAIL , nomeArquivo1 , checkstyle ,ENDC ))
+                print
+                contador += 1 
+            else:
+                pass
+    if (contador > 0):
+        print
+        sys.stderr.write("%s Favor remover as violações que foram adicionadas antes de realizar novo Push %s\n" %(FAIL ,ENDC))
+        sys.exit(1)
+    else:
+        print
+        sys.stderr.write("%sCommit aprovado%s \n" %(OKGREEN , ENDC))
+        sys.exit(0)
+    return contador
+
+# Verificando requisitos do script
+verificaRequisitos()
+
+# Verificando se o chamado é imediata
+verificaPrioridade()
+
+# Obtendo a lista de arquivos modificados e selecionando os arquivos .JAVA
+arquivosLocais = capturaAlteracoes()
+
+exibeModificacoes(arquivosLocais)
+
+print "Verificando Checkstyle..."
+
+violacoesLocais = verificaViolacoes(arquivosLocais)
+
+criaDiretorioTemp("~/masterTempCheckstyle")
+
+# Aqui eu tenho a lista de caminho dos arquivos da master
+arquivosMaster = getArquivosMaster(violacoesLocais)
+
+# Aqui eu tenho o dicionário com o nome do arquivo da master e suas violações
+violacoesMaster = verificaViolacoes(arquivosMaster)
+
+apagaDiretorioTemp("~/masterTempCheckstyle")
+
+comparaViolacoes(violacoesLocais,violacoesMaster)
